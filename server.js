@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -16,20 +15,33 @@ const ffprobePath = require("ffprobe-static").path;
 const app = express();
 
 const PORT = process.env.PORT || 10000;
+
 const MAX_UPLOAD_SIZE =
   Number(process.env.MAX_UPLOAD_SIZE) || 1024 * 1024 * 1024;
+
 const MAX_VIDEO_DURATION =
   Number(process.env.MAX_VIDEO_DURATION) || 350 * 60;
 
+// Gemini Recap Models
 const GEMINI_MODEL =
   process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
+const GEMINI_FALLBACK_MODELS = (
+  process.env.GEMINI_FALLBACK_MODELS ||
+  "gemini-3.7-flash,gemini-3.6-flash"
+)
+  .split(",")
+  .map(model => model.trim())
+  .filter(Boolean);
+
+// Gemini TTS
 const GEMINI_TTS_MODEL =
   process.env.GEMINI_TTS_MODEL || "gemini-3.8-flash-tts";
 
 const GEMINI_TTS_VOICE =
   process.env.GEMINI_TTS_VOICE || "Kore";
 
+// Directories
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 const OUTPUT_DIR = path.join(__dirname, "outputs");
 const TEMP_DIR = path.join(__dirname, "temp");
@@ -38,22 +50,33 @@ for (const dir of [UPLOAD_DIR, OUTPUT_DIR, TEMP_DIR]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
+if (!ffmpegPath) {
+  throw new Error("FFmpeg binary was not found.");
+}
+
+if (!ffprobePath) {
+  throw new Error("FFprobe binary was not found.");
+}
+
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
+
+// --------------------------------------------------
+// EXPRESS CONFIGURATION
+// --------------------------------------------------
 
 app.use(express.json({ limit: "10mb" }));
 
 app.use(
   cors({
     origin: process.env.FRONTEND_URL
-      ? process.env.FRONTEND_URL.split(",")
+      ? process.env.FRONTEND_URL.split(",").map(x => x.trim())
       : "*",
     methods: ["GET", "POST", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"]
   })
 );
 
-// Serve generated audio and video files.
 app.use("/outputs", express.static(OUTPUT_DIR));
 
 // --------------------------------------------------
@@ -66,24 +89,130 @@ const jobs = new Map();
 // HELPERS
 // --------------------------------------------------
 
-function getAI() {
+function getAIClient() {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is not configured.");
   }
 
-  const { GoogleGenAI } = require("@google/genai");
-
-  return new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY
-  });
-}
-
-function getAIClient() {
   return import("@google/genai").then(({ GoogleGenAI }) => {
     return new GoogleGenAI({
       apiKey: process.env.GEMINI_API_KEY
     });
   });
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isTemporaryGeminiError(error) {
+  const message = String(
+    error?.message || error || ""
+  ).toLowerCase();
+
+  const status = Number(
+    error?.statusCode ||
+    error?.code ||
+    error?.response?.status ||
+    0
+  );
+
+  const statusText = String(error?.status || "").toLowerCase();
+
+  return (
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    statusText === "unavailable" ||
+    statusText === "resource_exhausted" ||
+    message.includes("high demand") ||
+    message.includes("overloaded") ||
+    message.includes("temporarily unavailable") ||
+    message.includes("resource exhausted") ||
+    message.includes("service unavailable") ||
+    message.includes("503") ||
+    message.includes("429") ||
+    message.includes("502") ||
+    message.includes("504")
+  );
+}
+
+// Automatically try alternative Gemini models.
+// Video is uploaded only once; generation is retried per model.
+async function generateRecapWithFallback(ai, contents) {
+  const models = [
+    ...new Set([
+      GEMINI_MODEL,
+      ...GEMINI_FALLBACK_MODELS
+    ])
+  ];
+
+  let lastError = null;
+
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        console.log(
+          `Gemini recap: ${model}, attempt ${attempt}/2`
+        );
+
+        const response = await ai.models.generateContent({
+          model,
+          contents
+        });
+
+        const recapText = response.text;
+
+        if (!recapText || !recapText.trim()) {
+          throw new Error(
+            `Gemini ${model} returned an empty recap.`
+          );
+        }
+
+        console.log(
+          `Gemini recap succeeded using ${model}`
+        );
+
+        return {
+          text: recapText.trim(),
+          model
+        };
+
+      } catch (error) {
+        lastError = error;
+
+        console.error(
+          `Gemini ${model} failed:`,
+          error.message
+        );
+
+        // Do not retry authentication, invalid model,
+        // or other non-temporary errors.
+        if (!isTemporaryGeminiError(error)) {
+          throw error;
+        }
+
+        if (attempt < 2) {
+          await sleep(3000 * attempt);
+        }
+      }
+    }
+
+    console.log(
+      `${model} unavailable. Trying next model.`
+    );
+  }
+
+  const finalError = new Error(
+    "Gemini Models အားလုံး လက်ရှိဝန်ပိနေပါတယ်။ ခဏစောင့်ပြီး ပြန်စမ်းပါ။"
+  );
+
+  finalError.status = 503;
+  finalError.originalError = lastError;
+
+  throw finalError;
 }
 
 function getVideoInfo(filePath) {
@@ -116,7 +245,9 @@ function getVideoInfo(filePath) {
         resolution: `${width}x${height}`,
         frameRate: videoStream.r_frame_rate || "unknown",
         videoCodec: videoStream.codec_name || "unknown",
-        audioCodec: audioStream ? audioStream.codec_name : null,
+        audioCodec: audioStream
+          ? audioStream.codec_name
+          : null,
         hasAudio: Boolean(audioStream),
         fileSize: Number(metadata.format.size || 0),
         format: metadata.format.format_name || "unknown"
@@ -151,6 +282,7 @@ function splitText(text, maxChars = 3000) {
 
   for (const sentence of sentences) {
     const part = sentence.trim();
+
     if (!part) continue;
 
     if (part.length > maxChars) {
@@ -178,6 +310,14 @@ function splitText(text, maxChars = 3000) {
 
   return chunks;
 }
+
+function outputUrl(req, fileName) {
+  return `${req.protocol}://${req.get("host")}/outputs/${encodeURIComponent(fileName)}`;
+}
+
+// --------------------------------------------------
+// GEMINI SPEECH GENERATION
+// --------------------------------------------------
 
 async function generateSpeech(ai, text, outputPath) {
   const response = await ai.models.generateContent({
@@ -215,7 +355,9 @@ async function generateSpeech(ai, text, outputPath) {
     );
 
   if (!audioPart) {
-    throw new Error("Gemini TTS returned no audio data.");
+    throw new Error(
+      "Gemini TTS returned no audio data."
+    );
   }
 
   const audioData = audioPart.inlineData.data;
@@ -226,6 +368,10 @@ async function generateSpeech(ai, text, outputPath) {
 
   await fsp.writeFile(outputPath, audioBuffer);
 }
+
+// --------------------------------------------------
+// COMBINE AUDIO FILES
+// --------------------------------------------------
 
 async function combineWavFiles(files, outputPath) {
   if (!files.length) {
@@ -264,10 +410,6 @@ async function combineWavFiles(files, outputPath) {
       await fsp.unlink(manifestPath);
     }
   }
-}
-
-function outputUrl(req, fileName) {
-  return `${req.protocol}://${req.get("host")}/outputs/${fileName}`;
 }
 
 // --------------------------------------------------
@@ -328,7 +470,7 @@ app.get("/", (req, res) => {
     success: true,
     service: "Burmese Auto Recap Backend",
     status: "OK",
-    version: "2.0.0"
+    version: "3.0.0"
   });
 });
 
@@ -340,6 +482,7 @@ app.get("/api/health", (req, res) => {
     ffprobe: Boolean(ffprobePath),
     geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
     geminiModel: GEMINI_MODEL,
+    geminiFallbackModels: GEMINI_FALLBACK_MODELS,
     ttsModel: GEMINI_TTS_MODEL,
     timestamp: new Date().toISOString()
   });
@@ -349,101 +492,114 @@ app.get("/api/health", (req, res) => {
 // UPLOAD VIDEO
 // --------------------------------------------------
 
-app.post("/api/upload", upload.single("video"), async (req, res) => {
-  let uploadedFilePath = null;
+app.post(
+  "/api/upload",
+  upload.single("video"),
+  async (req, res) => {
+    let uploadedFilePath = null;
 
-  try {
-    if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: "Please select a video file."
-      });
-    }
-
-    uploadedFilePath = req.file.path;
-
-    const jobId = crypto.randomUUID();
-
-    const job = {
-      id: jobId,
-      status: "analyzing",
-      progress: 0,
-      stage: "Analyzing video",
-      originalName: req.file.originalname,
-      filePath: uploadedFilePath,
-      fileSize: req.file.size,
-      createdAt: new Date().toISOString(),
-
-      videoInfo: null,
-
-      recapScript: null,
-      recapStatus: "not_started",
-
-      voiceFile: null,
-      voiceUrl: null,
-      voiceStatus: "not_started",
-
-      outputFile: null,
-      outputUrl: null,
-      renderStatus: "not_started",
-
-      error: null
-    };
-
-    jobs.set(jobId, job);
-
-    const videoInfo = await getVideoInfo(uploadedFilePath);
-
-    if (videoInfo.duration > MAX_VIDEO_DURATION) {
-      fs.unlinkSync(uploadedFilePath);
-      jobs.delete(jobId);
-
-      return res.status(400).json({
-        success: false,
-        message: "Video duration exceeds the maximum allowed duration.",
-        maxDuration: MAX_VIDEO_DURATION,
-        actualDuration: videoInfo.duration
-      });
-    }
-
-    job.videoInfo = videoInfo;
-    job.status = "ready";
-    job.progress = 5;
-    job.stage = "Video ready";
-
-    return res.status(201).json({
-      success: true,
-      message: "Video uploaded successfully.",
-
-      job: {
-        id: job.id,
-        status: job.status,
-        progress: job.progress,
-        stage: job.stage,
-        originalName: job.originalName,
-        fileSize: job.fileSize,
-        videoInfo: job.videoInfo,
-        recapStatus: job.recapStatus
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "Please select a video file."
+        });
       }
-    });
-  } catch (error) {
-    console.error("UPLOAD ERROR:", error);
 
-    if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
-      try {
-        fs.unlinkSync(uploadedFilePath);
-      } catch (_) {}
+      uploadedFilePath = req.file.path;
+
+      const jobId = crypto.randomUUID();
+
+      const job = {
+        id: jobId,
+        status: "analyzing",
+        progress: 0,
+        stage: "Analyzing video",
+
+        originalName: req.file.originalname,
+        filePath: uploadedFilePath,
+        fileSize: req.file.size,
+        createdAt: new Date().toISOString(),
+
+        videoInfo: null,
+
+        recapScript: null,
+        recapModel: null,
+        recapStatus: "not_started",
+
+        voiceFile: null,
+        voiceUrl: null,
+        voiceStatus: "not_started",
+
+        outputFile: null,
+        outputUrl: null,
+        renderStatus: "not_started",
+
+        error: null
+      };
+
+      jobs.set(jobId, job);
+
+      const videoInfo = await getVideoInfo(
+        uploadedFilePath
+      );
+
+      if (videoInfo.duration > MAX_VIDEO_DURATION) {
+        await fsp.unlink(uploadedFilePath);
+        jobs.delete(jobId);
+
+        return res.status(400).json({
+          success: false,
+          message:
+            "Video duration exceeds the maximum allowed duration.",
+          maxDuration: MAX_VIDEO_DURATION,
+          actualDuration: videoInfo.duration
+        });
+      }
+
+      job.videoInfo = videoInfo;
+      job.status = "ready";
+      job.progress = 5;
+      job.stage = "Video ready";
+
+      return res.status(201).json({
+        success: true,
+        message: "Video uploaded successfully.",
+
+        job: {
+          id: job.id,
+          status: job.status,
+          progress: job.progress,
+          stage: job.stage,
+          originalName: job.originalName,
+          fileSize: job.fileSize,
+          videoInfo: job.videoInfo,
+          recapStatus: job.recapStatus
+        }
+      });
+
+    } catch (error) {
+      console.error("UPLOAD ERROR:", error);
+
+      if (
+        uploadedFilePath &&
+        fs.existsSync(uploadedFilePath)
+      ) {
+        try {
+          await fsp.unlink(uploadedFilePath);
+        } catch (_) {}
+      }
+
+      return res.status(500).json({
+        success: false,
+        message: error.message || "Video upload failed."
+      });
     }
-
-    return res.status(500).json({
-      success: false,
-      message: error.message || "Video upload failed."
-    });
   }
-});
+);
 
 // --------------------------------------------------
-// GEMINI RECAP
+// GEMINI RECAP WITH AUTOMATIC FALLBACK
 // --------------------------------------------------
 
 app.post("/api/jobs/:id/recap", async (req, res) => {
@@ -492,6 +648,7 @@ app.post("/api/jobs/:id/recap", async (req, res) => {
 
     const mimeType = mimeTypes[ext] || "video/mp4";
 
+    // Upload once. Model fallback reuses this Gemini file.
     let geminiFile = await ai.files.upload({
       file: job.filePath,
       config: {
@@ -508,10 +665,12 @@ app.post("/api/jobs/:id/recap", async (req, res) => {
 
     while (geminiFile.state === "PROCESSING") {
       if (Date.now() - startedAt > timeout) {
-        throw new Error("Gemini video processing timed out.");
+        throw new Error(
+          "Gemini video processing timed out."
+        );
       }
 
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      await sleep(3000);
 
       geminiFile = await ai.files.get({
         name: geminiFile.name
@@ -519,7 +678,15 @@ app.post("/api/jobs/:id/recap", async (req, res) => {
     }
 
     if (geminiFile.state === "FAILED") {
-      throw new Error("Gemini could not process the video.");
+      throw new Error(
+        "Gemini could not process the video."
+      );
+    }
+
+    if (geminiFile.state !== "ACTIVE") {
+      throw new Error(
+        `Unexpected Gemini file state: ${geminiFile.state}`
+      );
     }
 
     job.progress = 45;
@@ -546,64 +713,80 @@ Rules:
 12. Do not add unrelated opinions or false claims.
 13. Start with an engaging hook.
 14. Return only the Burmese recap script.
+
+IMPORTANT:
+Analyze the actual uploaded video.
+Do not create a story based on assumptions.
+Preserve important story details.
 `;
 
-    const response = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              fileData: {
-                fileUri: geminiFile.uri,
-                mimeType: geminiFile.mimeType || mimeType
-              }
-            },
-            {
-              text: recapPrompt
+    const contents = [
+      {
+        role: "user",
+        parts: [
+          {
+            fileData: {
+              fileUri: geminiFile.uri,
+              mimeType: geminiFile.mimeType || mimeType
             }
-          ]
-        }
-      ]
-    });
+          },
+          {
+            text: recapPrompt
+          }
+        ]
+      }
+    ];
 
-    const recapText = response.text;
+    const result = await generateRecapWithFallback(
+      ai,
+      contents
+    );
 
-    if (!recapText || !recapText.trim()) {
-      throw new Error("Gemini returned an empty recap.");
-    }
+    job.recapScript = result.text;
+    job.recapModel = result.model;
 
-    job.recapScript = recapText.trim();
     job.recapStatus = "completed";
     job.status = "ready";
     job.progress = 50;
     job.stage = "Burmese recap script generated";
+    job.error = null;
 
     return res.json({
       success: true,
       message: "Burmese recap script generated successfully.",
+      usedModel: result.model,
+
       job: {
         id: job.id,
         status: job.status,
         progress: job.progress,
         stage: job.stage,
         recapStatus: job.recapStatus,
-        recapScript: job.recapScript
+        recapScript: job.recapScript,
+        recapModel: job.recapModel
       }
     });
+
   } catch (error) {
     console.error("GEMINI RECAP ERROR:", error);
+
+    const temporaryError =
+      isTemporaryGeminiError(error) ||
+      Number(error.status) === 503;
 
     job.recapStatus = "failed";
     job.status = "error";
     job.error = error.message || "AI recap failed.";
     job.stage = "AI recap failed";
 
-    return res.status(500).json({
+    return res.status(
+      temporaryError ? 503 : 500
+    ).json({
       success: false,
-      message: job.error
+      message: job.error,
+      errorType: temporaryError
+        ? "GEMINI_TEMPORARILY_UNAVAILABLE"
+        : "GEMINI_RECAP_FAILED"
     });
   }
 });
@@ -656,56 +839,75 @@ app.post("/api/jobs/:id/voice", async (req, res) => {
 
     const chunkFiles = [];
 
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkPath = path.join(
-        TEMP_DIR,
-        `${job.id}-voice-${i}.wav`
+    try {
+      for (let i = 0; i < chunks.length; i++) {
+        const chunkPath = path.join(
+          TEMP_DIR,
+          `${job.id}-voice-${i}.wav`
+        );
+
+        await generateSpeech(
+          ai,
+          chunks[i],
+          chunkPath
+        );
+
+        chunkFiles.push(chunkPath);
+
+        job.progress = 55 + Math.round(
+          ((i + 1) / chunks.length) * 25
+        );
+
+        job.stage =
+          `Generating voice ${i + 1}/${chunks.length}`;
+      }
+
+      const voiceFileName = `${job.id}-voice.wav`;
+
+      const voicePath = path.join(
+        OUTPUT_DIR,
+        voiceFileName
       );
 
-      await generateSpeech(ai, chunks[i], chunkPath);
-
-      chunkFiles.push(chunkPath);
-
-      job.progress = 55 + Math.round(
-        ((i + 1) / chunks.length) * 25
+      await combineWavFiles(
+        chunkFiles,
+        voicePath
       );
 
-      job.stage =
-        `Generating voice ${i + 1}/${chunks.length}`;
-    }
+      job.voiceFile = voicePath;
+      job.voiceUrl = outputUrl(req, voiceFileName);
+      job.voiceStatus = "completed";
+      job.progress = 80;
+      job.stage = "Burmese voice generated";
 
-    const voiceFileName = `${job.id}-voice.wav`;
+      return res.json({
+        success: true,
+        message: "Burmese AI voice generated successfully.",
 
-    const voicePath = path.join(
-      OUTPUT_DIR,
-      voiceFileName
-    );
+        job: {
+          id: job.id,
+          voiceStatus: job.voiceStatus,
+          voiceUrl: job.voiceUrl,
+          progress: job.progress,
+          stage: job.stage
+        }
+      });
 
-    await combineWavFiles(chunkFiles, voicePath);
-
-    for (const file of chunkFiles) {
-      if (fs.existsSync(file)) {
-        await fsp.unlink(file);
+    } finally {
+      for (const file of chunkFiles) {
+        if (fs.existsSync(file)) {
+          try {
+            await fsp.unlink(file);
+          } catch (cleanupError) {
+            console.error(
+              "VOICE TEMP CLEANUP ERROR:",
+              cleanupError.message
+            );
+          }
+        }
       }
     }
 
-    job.voiceFile = voicePath;
-    job.voiceUrl = outputUrl(req, voiceFileName);
-    job.voiceStatus = "completed";
-    job.progress = 80;
-    job.stage = "Burmese voice generated";
-
-    return res.json({
-      success: true,
-      message: "Burmese AI voice generated successfully.",
-      job: {
-        id: job.id,
-        voiceStatus: job.voiceStatus,
-        voiceUrl: job.voiceUrl,
-        progress: job.progress,
-        stage: job.stage
-      }
-    });
   } catch (error) {
     console.error("VOICE GENERATION ERROR:", error);
 
@@ -796,6 +998,7 @@ app.post("/api/jobs/:id/render", async (req, res) => {
     return res.json({
       success: true,
       message: "MP4 rendered successfully.",
+
       job: {
         id: job.id,
         renderStatus: job.renderStatus,
@@ -804,6 +1007,7 @@ app.post("/api/jobs/:id/render", async (req, res) => {
         stage: job.stage
       }
     });
+
   } catch (error) {
     console.error("RENDER ERROR:", error);
 
@@ -848,6 +1052,7 @@ app.get("/api/jobs/:id", (req, res) => {
 
       recapStatus: job.recapStatus,
       recapScript: job.recapScript,
+      recapModel: job.recapModel,
 
       voiceStatus: job.voiceStatus,
       voiceUrl: job.voiceUrl,
@@ -893,6 +1098,7 @@ app.delete("/api/jobs/:id", async (req, res) => {
       success: true,
       message: "Job deleted successfully."
     });
+
   } catch (error) {
     console.error("DELETE ERROR:", error);
 
@@ -942,6 +1148,9 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Upload Directory: ${UPLOAD_DIR}`);
   console.log(`Output Directory: ${OUTPUT_DIR}`);
   console.log(`Gemini Recap Model: ${GEMINI_MODEL}`);
+  console.log(
+    `Gemini Fallback Models: ${GEMINI_FALLBACK_MODELS.join(", ")}`
+  );
   console.log(`Gemini TTS Model: ${GEMINI_TTS_MODEL}`);
   console.log("--------------------------------------");
 });
