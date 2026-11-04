@@ -1,8 +1,7 @@
-
 {
-  "name": "burmese-auto-recap-backend",
-  "version": "3.0.0",
-  "description": "Burmese AI Movie Recap and Video Rendering Backend",
+  "name": "hwa-burmese-auto-recap",
+  "version": "4.0.0",
+  "description": "HWA Burmese AI Movie Recap and Video Voiceover Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
