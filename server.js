@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require("express");
@@ -22,7 +23,6 @@ const MAX_UPLOAD_SIZE =
 const MAX_VIDEO_DURATION =
   Number(process.env.MAX_VIDEO_DURATION) || 350 * 60;
 
-// Gemini Recap Models
 const GEMINI_MODEL =
   process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
@@ -34,14 +34,12 @@ const GEMINI_FALLBACK_MODELS = (
   .map(model => model.trim())
   .filter(Boolean);
 
-// Gemini TTS
 const GEMINI_TTS_MODEL =
   process.env.GEMINI_TTS_MODEL || "gemini-3.8-flash-tts";
 
 const GEMINI_TTS_VOICE =
   process.env.GEMINI_TTS_VOICE || "Kore";
 
-// Directories
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 const OUTPUT_DIR = path.join(__dirname, "outputs");
 const TEMP_DIR = path.join(__dirname, "temp");
@@ -72,7 +70,7 @@ app.use(
     origin: process.env.FRONTEND_URL
       ? process.env.FRONTEND_URL.split(",").map(x => x.trim())
       : "*",
-    methods: ["GET", "POST", "DELETE"],
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"]
   })
 );
@@ -86,8 +84,12 @@ app.use("/outputs", express.static(OUTPUT_DIR));
 const jobs = new Map();
 
 // --------------------------------------------------
-// HELPERS
+// GENERAL HELPERS
 // --------------------------------------------------
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function getAIClient() {
   if (!process.env.GEMINI_API_KEY) {
@@ -99,10 +101,6 @@ function getAIClient() {
       apiKey: process.env.GEMINI_API_KEY
     });
   });
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function isTemporaryGeminiError(error) {
@@ -117,7 +115,9 @@ function isTemporaryGeminiError(error) {
     0
   );
 
-  const statusText = String(error?.status || "").toLowerCase();
+  const statusText = String(
+    error?.status || ""
+  ).toLowerCase();
 
   return (
     status === 429 ||
@@ -139,8 +139,37 @@ function isTemporaryGeminiError(error) {
   );
 }
 
-// Automatically try alternative Gemini models.
-// Video is uploaded only once; generation is retried per model.
+function getErrorMessage(error) {
+  if (typeof error?.message === "string") {
+    return error.message;
+  }
+
+  return String(error || "Unknown server error.");
+}
+
+function outputUrl(req, fileName) {
+  const host = req.get("host");
+
+  return (
+    `${req.protocol}://${host}/outputs/` +
+    encodeURIComponent(fileName)
+  );
+}
+
+function safeUnlink(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return Promise.resolve();
+  }
+
+  return fsp.unlink(filePath).catch(error => {
+    console.error("FILE CLEANUP ERROR:", error.message);
+  });
+}
+
+// --------------------------------------------------
+// GEMINI MODEL FALLBACK
+// --------------------------------------------------
+
 async function generateRecapWithFallback(ai, contents) {
   const models = [
     ...new Set([
@@ -165,7 +194,10 @@ async function generateRecapWithFallback(ai, contents) {
 
         const recapText = response.text;
 
-        if (!recapText || !recapText.trim()) {
+        if (
+          !recapText ||
+          !recapText.trim()
+        ) {
           throw new Error(
             `Gemini ${model} returned an empty recap.`
           );
@@ -185,11 +217,9 @@ async function generateRecapWithFallback(ai, contents) {
 
         console.error(
           `Gemini ${model} failed:`,
-          error.message
+          getErrorMessage(error)
         );
 
-        // Do not retry authentication, invalid model,
-        // or other non-temporary errors.
         if (!isTemporaryGeminiError(error)) {
           throw error;
         }
@@ -206,7 +236,7 @@ async function generateRecapWithFallback(ai, contents) {
   }
 
   const finalError = new Error(
-    "Gemini Models အားလုံး လက်ရှိဝန်ပိနေပါတယ်။ ခဏစောင့်ပြီး ပြန်စမ်းပါ။"
+    "Gemini Models အားလုံး လက်ရှိအချိန်တွင် အလုပ်မလုပ်နိုင်သေးပါ။ ခဏစောင့်ပြီး ပြန်စမ်းပါ။"
   );
 
   finalError.status = 503;
@@ -215,10 +245,16 @@ async function generateRecapWithFallback(ai, contents) {
   throw finalError;
 }
 
+// --------------------------------------------------
+// VIDEO INFORMATION
+// --------------------------------------------------
+
 function getVideoInfo(filePath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, metadata) => {
-      if (err) return reject(err);
+      if (err) {
+        return reject(err);
+      }
 
       const videoStream = metadata.streams.find(
         stream => stream.codec_type === "video"
@@ -234,9 +270,17 @@ function getVideoInfo(filePath) {
         );
       }
 
-      const duration = Number(metadata.format.duration || 0);
-      const width = Number(videoStream.width || 0);
-      const height = Number(videoStream.height || 0);
+      const duration = Number(
+        metadata.format.duration || 0
+      );
+
+      const width = Number(
+        videoStream.width || 0
+      );
+
+      const height = Number(
+        videoStream.height || 0
+      );
 
       resolve({
         duration,
@@ -256,6 +300,10 @@ function getVideoInfo(filePath) {
   });
 }
 
+// --------------------------------------------------
+// FFMPEG RUNNER
+// --------------------------------------------------
+
 function runFFmpeg(command) {
   return new Promise((resolve, reject) => {
     command
@@ -265,17 +313,23 @@ function runFFmpeg(command) {
   });
 }
 
-function splitText(text, maxChars = 3000) {
-  const normalized = text
+// --------------------------------------------------
+// TEXT SPLITTER
+// --------------------------------------------------
+
+function splitText(text, maxChars = 2500) {
+  const normalized = String(text || "")
     .replace(/\r/g, "")
     .replace(/[ \t]+/g, " ")
     .trim();
 
-  if (!normalized) return [];
+  if (!normalized) {
+    return [];
+  }
 
-  const sentences = normalized.match(/[^။.!?]+[။.!?]?/g) || [
-    normalized
-  ];
+  const sentences = normalized.match(
+    /[^။.!?]+[။.!?]?/g
+  ) || [normalized];
 
   const chunks = [];
   let current = "";
@@ -291,35 +345,116 @@ function splitText(text, maxChars = 3000) {
         current = "";
       }
 
-      for (let i = 0; i < part.length; i += maxChars) {
-        chunks.push(part.slice(i, i + maxChars));
+      for (
+        let i = 0;
+        i < part.length;
+        i += maxChars
+      ) {
+        chunks.push(
+          part.slice(i, i + maxChars)
+        );
       }
 
       continue;
     }
 
-    if ((current + " " + part).trim().length > maxChars) {
-      if (current) chunks.push(current);
+    const combined = current
+      ? `${current} ${part}`
+      : part;
+
+    if (combined.length > maxChars) {
+      if (current) {
+        chunks.push(current);
+      }
+
       current = part;
     } else {
-      current = (current + " " + part).trim();
+      current = combined;
     }
   }
 
-  if (current) chunks.push(current);
+  if (current) {
+    chunks.push(current);
+  }
 
   return chunks;
 }
 
-function outputUrl(req, fileName) {
-  return `${req.protocol}://${req.get("host")}/outputs/${encodeURIComponent(fileName)}`;
+// --------------------------------------------------
+// WAV HEADER GENERATOR
+// --------------------------------------------------
+
+function createWavBuffer(
+  pcmBuffer,
+  sampleRate = 24000,
+  channels = 1,
+  bitsPerSample = 16
+) {
+  const bytesPerSample = bitsPerSample / 8;
+
+  const blockAlign =
+    channels * bytesPerSample;
+
+  const byteRate =
+    sampleRate * blockAlign;
+
+  const header = Buffer.alloc(44);
+
+  header.write("RIFF", 0);
+  header.writeUInt32LE(
+    36 + pcmBuffer.length,
+    4
+  );
+
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+
+  header.writeUInt32LE(
+    sampleRate,
+    24
+  );
+
+  header.writeUInt32LE(
+    byteRate,
+    28
+  );
+
+  header.writeUInt16LE(
+    blockAlign,
+    32
+  );
+
+  header.writeUInt16LE(
+    bitsPerSample,
+    34
+  );
+
+  header.write("data", 36);
+
+  header.writeUInt32LE(
+    pcmBuffer.length,
+    40
+  );
+
+  return Buffer.concat([
+    header,
+    pcmBuffer
+  ]);
 }
 
 // --------------------------------------------------
-// GEMINI SPEECH GENERATION
+// GEMINI TTS GENERATION
 // --------------------------------------------------
 
-async function generateSpeech(ai, text, outputPath) {
+async function generateSpeech(
+  ai,
+  text,
+  outputPath
+) {
   const response = await ai.models.generateContent({
     model: GEMINI_TTS_MODEL,
 
@@ -328,12 +463,11 @@ async function generateSpeech(ai, text, outputPath) {
         role: "user",
         parts: [
           {
-            text,
-            speechMetadata: {
-              style:
-                "Natural Burmese narration, clear pronunciation, " +
-                "warm storytelling voice, moderate pace."
-            }
+            text:
+              "Read the following Burmese narration naturally. " +
+              "Use clear Burmese pronunciation, a warm storytelling " +
+              "voice, and a moderate speaking pace.\n\n" +
+              text
           }
         ]
       }
@@ -341,9 +475,12 @@ async function generateSpeech(ai, text, outputPath) {
 
     config: {
       responseModalities: ["AUDIO"],
+
       speechConfig: {
         voiceConfig: {
-          voice: GEMINI_TTS_VOICE
+          prebuiltVoiceConfig: {
+            voiceName: GEMINI_TTS_VOICE
+          }
         }
       }
     }
@@ -360,74 +497,124 @@ async function generateSpeech(ai, text, outputPath) {
     );
   }
 
-  const audioData = audioPart.inlineData.data;
+  const audioData =
+    audioPart.inlineData.data;
 
-  const audioBuffer = Buffer.isBuffer(audioData)
-    ? audioData
-    : Buffer.from(audioData, "base64");
+  const mimeType =
+    audioPart.inlineData.mimeType || "";
 
-  await fsp.writeFile(outputPath, audioBuffer);
-}
+  const audioBuffer = Buffer.from(
+    audioData,
+    "base64"
+  );
 
-// --------------------------------------------------
-// COMBINE AUDIO FILES
-// --------------------------------------------------
-
-async function combineWavFiles(files, outputPath) {
-  if (!files.length) {
-    throw new Error("No audio files to combine.");
+  if (!audioBuffer.length) {
+    throw new Error(
+      "Gemini returned empty audio data."
+    );
   }
 
-  if (files.length === 1) {
-    await fsp.copyFile(files[0], outputPath);
+  // Keep an existing valid WAV file.
+  if (
+    mimeType.toLowerCase().includes("wav") ||
+    audioBuffer.toString("ascii", 0, 4) === "RIFF"
+  ) {
+    await fsp.writeFile(
+      outputPath,
+      audioBuffer
+    );
+
     return;
   }
 
-  const manifestPath = path.join(
-    TEMP_DIR,
-    `${crypto.randomUUID()}.txt`
+  // Gemini PCM audio is commonly 16-bit little-endian.
+  const rateMatch = mimeType.match(
+    /rate=(\d+)/i
   );
 
-  const manifest = files
-    .map(file => {
-      const escaped = file.replace(/'/g, "'\\''");
-      return `file '${escaped}'`;
-    })
-    .join("\n");
+  const sampleRate = rateMatch
+    ? Number(rateMatch[1])
+    : 24000;
 
-  await fsp.writeFile(manifestPath, manifest, "utf8");
+  const wavBuffer = createWavBuffer(
+    audioBuffer,
+    sampleRate,
+    1,
+    16
+  );
 
-  try {
-    await runFFmpeg(
-      ffmpeg()
-        .input(manifestPath)
-        .inputOptions(["-f concat", "-safe 0"])
-        .outputOptions(["-c copy"])
-        .output(outputPath)
-    );
-  } finally {
-    if (fs.existsSync(manifestPath)) {
-      await fsp.unlink(manifestPath);
-    }
-  }
+  await fsp.writeFile(
+    outputPath,
+    wavBuffer
+  );
+
+  console.log(
+    "TTS audio saved:",
+    mimeType,
+    sampleRate,
+    audioBuffer.length
+  );
 }
 
 // --------------------------------------------------
-// MULTER UPLOAD
+// COMBINE AUDIO CHUNKS
 // --------------------------------------------------
 
-const storage = multer.diskStorage({
-  destination(req, file, cb) {
-    cb(null, UPLOAD_DIR);
-  },
-
-  filename(req, file, cb) {
-    const id = crypto.randomUUID();
-    const ext = path.extname(file.originalname).toLowerCase();
-
-    cb(null, `${id}${ext}`);
+async function combineWavFiles(
+  files,
+  outputPath
+) {
+  if (!files.length) {
+    throw new Error(
+      "No audio files to combine."
+    );
   }
-});
+
+  if (files.length === 1) {
+    await runFFmpeg(
+      ffmpeg()
+        .input(files[0])
+        .audioChannels(1)
+        .audioFrequency(24000)
+        .audioCodec("pcm_s16le")
+        .format("wav")
+        .output(outputPath)
+    );
+
+    return;
+  }
+
+  const command = ffmpeg();
+
+  for (const file of files) {
+    command.input(file);
+  }
+
+  const inputLabels = files
+    .map((_, index) => `[${index}:a:0]`)
+    .join("");
+
+  const filter =
+    `${inputLabels}` +
+    `concat=n=${files.length}:v=0:a=1[out]`;
+
+  await runFFmpeg(
+    command
+      .complexFilter(filter)
+      .outputOptions([
+        "-map [out]",
+        "-ac 1",
+        "-ar 24000",
+        "-c:a pcm_s16le"
+      ])
+      .format("wav")
+      .output(outputPath)
+  );
+}
+
+// --------------------------------------------------
+// MULTER VIDEO UPLOAD
+// --------------------------------------------------
 
 const allowedExtensions = [
   ".mp4",
@@ -438,6 +625,22 @@ const allowedExtensions = [
   ".m4v"
 ];
 
+const storage = multer.diskStorage({
+  destination(req, file, cb) {
+    cb(null, UPLOAD_DIR);
+  },
+
+  filename(req, file, cb) {
+    const id = crypto.randomUUID();
+
+    const ext = path.extname(
+      file.originalname
+    ).toLowerCase();
+
+    cb(null, `${id}${ext}`);
+  }
+});
+
 const upload = multer({
   storage,
 
@@ -447,7 +650,9 @@ const upload = multer({
   },
 
   fileFilter(req, file, cb) {
-    const ext = path.extname(file.originalname).toLowerCase();
+    const ext = path.extname(
+      file.originalname
+    ).toLowerCase();
 
     if (!allowedExtensions.includes(ext)) {
       return cb(
@@ -470,7 +675,7 @@ app.get("/", (req, res) => {
     success: true,
     service: "Burmese Auto Recap Backend",
     status: "OK",
-    version: "3.0.0"
+    version: "4.0.0"
   });
 });
 
@@ -478,12 +683,23 @@ app.get("/api/health", (req, res) => {
   res.json({
     success: true,
     status: "OK",
+
     ffmpeg: Boolean(ffmpegPath),
     ffprobe: Boolean(ffprobePath),
-    geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+
+    geminiConfigured: Boolean(
+      process.env.GEMINI_API_KEY
+    ),
+
     geminiModel: GEMINI_MODEL,
     geminiFallbackModels: GEMINI_FALLBACK_MODELS,
+
     ttsModel: GEMINI_TTS_MODEL,
+    ttsVoice: GEMINI_TTS_VOICE,
+
+    maxUploadSize: MAX_UPLOAD_SIZE,
+    maxVideoDuration: MAX_VIDEO_DURATION,
+
     timestamp: new Date().toISOString()
   });
 });
@@ -508,20 +724,49 @@ app.post(
 
       uploadedFilePath = req.file.path;
 
+      const videoInfo = await getVideoInfo(
+        uploadedFilePath
+      );
+
+      if (videoInfo.duration <= 0) {
+        await safeUnlink(uploadedFilePath);
+
+        return res.status(400).json({
+          success: false,
+          message: "Could not determine video duration."
+        });
+      }
+
+      if (
+        videoInfo.duration > MAX_VIDEO_DURATION
+      ) {
+        await safeUnlink(uploadedFilePath);
+
+        return res.status(400).json({
+          success: false,
+          message:
+            "Video duration exceeds the maximum allowed duration.",
+          maxDuration: MAX_VIDEO_DURATION,
+          actualDuration: videoInfo.duration
+        });
+      }
+
       const jobId = crypto.randomUUID();
 
       const job = {
         id: jobId,
-        status: "analyzing",
-        progress: 0,
-        stage: "Analyzing video",
+
+        status: "ready",
+        progress: 5,
+        stage: "Video ready",
 
         originalName: req.file.originalname,
         filePath: uploadedFilePath,
         fileSize: req.file.size,
+
         createdAt: new Date().toISOString(),
 
-        videoInfo: null,
+        videoInfo,
 
         recapScript: null,
         recapModel: null,
@@ -540,28 +785,6 @@ app.post(
 
       jobs.set(jobId, job);
 
-      const videoInfo = await getVideoInfo(
-        uploadedFilePath
-      );
-
-      if (videoInfo.duration > MAX_VIDEO_DURATION) {
-        await fsp.unlink(uploadedFilePath);
-        jobs.delete(jobId);
-
-        return res.status(400).json({
-          success: false,
-          message:
-            "Video duration exceeds the maximum allowed duration.",
-          maxDuration: MAX_VIDEO_DURATION,
-          actualDuration: videoInfo.duration
-        });
-      }
-
-      job.videoInfo = videoInfo;
-      job.status = "ready";
-      job.progress = 5;
-      job.stage = "Video ready";
-
       return res.status(201).json({
         success: true,
         message: "Video uploaded successfully.",
@@ -579,400 +802,499 @@ app.post(
       });
 
     } catch (error) {
-      console.error("UPLOAD ERROR:", error);
+      console.error(
+        "UPLOAD ERROR:",
+        error
+      );
 
-      if (
-        uploadedFilePath &&
-        fs.existsSync(uploadedFilePath)
-      ) {
-        try {
-          await fsp.unlink(uploadedFilePath);
-        } catch (_) {}
-      }
+      await safeUnlink(uploadedFilePath);
 
       return res.status(500).json({
         success: false,
-        message: error.message || "Video upload failed."
+        message: getErrorMessage(error)
       });
     }
   }
 );
 
 // --------------------------------------------------
-// GEMINI RECAP WITH AUTOMATIC FALLBACK
+// GEMINI RECAP
 // --------------------------------------------------
 
-app.post("/api/jobs/:id/recap", async (req, res) => {
-  const job = jobs.get(req.params.id);
+app.post(
+  "/api/jobs/:id/recap",
+  async (req, res) => {
+    const job = jobs.get(req.params.id);
 
-  if (!job) {
-    return res.status(404).json({
-      success: false,
-      message: "Job not found."
-    });
-  }
-
-  if (!job.filePath || !fs.existsSync(job.filePath)) {
-    return res.status(404).json({
-      success: false,
-      message: "Uploaded video file is missing."
-    });
-  }
-
-  if (job.recapStatus === "processing") {
-    return res.status(409).json({
-      success: false,
-      message: "Recap is already processing."
-    });
-  }
-
-  try {
-    const ai = await getAIClient();
-
-    job.status = "recapping";
-    job.recapStatus = "processing";
-    job.progress = 10;
-    job.stage = "Uploading video to Gemini";
-    job.error = null;
-
-    const ext = path.extname(job.filePath).toLowerCase();
-
-    const mimeTypes = {
-      ".mp4": "video/mp4",
-      ".mov": "video/quicktime",
-      ".mkv": "video/x-matroska",
-      ".webm": "video/webm",
-      ".avi": "video/x-msvideo",
-      ".m4v": "video/mp4"
-    };
-
-    const mimeType = mimeTypes[ext] || "video/mp4";
-
-    // Upload once. Model fallback reuses this Gemini file.
-    let geminiFile = await ai.files.upload({
-      file: job.filePath,
-      config: {
-        mimeType,
-        displayName: job.originalName
-      }
-    });
-
-    job.progress = 25;
-    job.stage = "Gemini is preparing the video";
-
-    const startedAt = Date.now();
-    const timeout = 10 * 60 * 1000;
-
-    while (geminiFile.state === "PROCESSING") {
-      if (Date.now() - startedAt > timeout) {
-        throw new Error(
-          "Gemini video processing timed out."
-        );
-      }
-
-      await sleep(3000);
-
-      geminiFile = await ai.files.get({
-        name: geminiFile.name
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: "Job not found."
       });
     }
 
-    if (geminiFile.state === "FAILED") {
-      throw new Error(
-        "Gemini could not process the video."
-      );
+    if (
+      !job.filePath ||
+      !fs.existsSync(job.filePath)
+    ) {
+      return res.status(404).json({
+        success: false,
+        message: "Uploaded video file is missing."
+      });
     }
 
-    if (geminiFile.state !== "ACTIVE") {
-      throw new Error(
-        `Unexpected Gemini file state: ${geminiFile.state}`
-      );
+    if (job.recapStatus === "processing") {
+      return res.status(409).json({
+        success: false,
+        message: "Recap is already processing."
+      });
     }
 
-    job.progress = 45;
-    job.stage = "AI is analyzing the story";
+    try {
+      const ai = await getAIClient();
 
-    const recapPrompt = `
+      job.status = "recapping";
+      job.recapStatus = "processing";
+      job.progress = 10;
+      job.stage = "Uploading video to Gemini";
+      job.error = null;
+
+      const ext = path.extname(
+        job.filePath
+      ).toLowerCase();
+
+      const mimeTypes = {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".mkv": "video/x-matroska",
+        ".webm": "video/webm",
+        ".avi": "video/x-msvideo",
+        ".m4v": "video/mp4"
+      };
+
+      const mimeType =
+        mimeTypes[ext] || "video/mp4";
+
+      let geminiFile = await ai.files.upload({
+        file: job.filePath,
+
+        config: {
+          mimeType,
+          displayName: job.originalName
+        }
+      });
+
+      job.progress = 25;
+      job.stage = "Gemini is preparing the video";
+
+      const startedAt = Date.now();
+      const timeout = 10 * 60 * 1000;
+
+      while (
+        geminiFile.state === "PROCESSING"
+      ) {
+        if (
+          Date.now() - startedAt > timeout
+        ) {
+          throw new Error(
+            "Gemini video processing timed out."
+          );
+        }
+
+        await sleep(3000);
+
+        geminiFile = await ai.files.get({
+          name: geminiFile.name
+        });
+      }
+
+      if (geminiFile.state === "FAILED") {
+        throw new Error(
+          "Gemini could not process the video."
+        );
+      }
+
+      if (geminiFile.state !== "ACTIVE") {
+        throw new Error(
+          `Unexpected Gemini file state: ${geminiFile.state}`
+        );
+      }
+
+      job.progress = 45;
+      job.stage = "AI is analyzing the story";
+
+      const recapPrompt = `
 You are an expert movie recap storyteller.
 
-Analyze the uploaded video and write a detailed,
+Analyze the actual uploaded video and write a detailed,
 natural Burmese-language movie recap script.
 
-Rules:
+IMPORTANT RULES:
+
 1. Write naturally and fluently in Burmese.
 2. Explain the story in chronological order.
 3. Include important characters and motivations.
 4. Include conflicts and turning points.
-5. Paraphrase meaningful conversations.
-6. Explain the ending if visible.
-7. Do not invent scenes, names, dialogue, or events.
-8. Do not guess unclear details.
-9. Preserve important story details.
-10. Do not make the recap extremely short.
-11. Use engaging narration suitable for a movie recap.
-12. Do not add unrelated opinions or false claims.
-13. Start with an engaging hook.
-14. Return only the Burmese recap script.
+5. Include meaningful conversations and their meaning.
+6. Explain important scenes in detail.
+7. Explain the ending if it is visible.
+8. Do not invent scenes, names, dialogue, or events.
+9. Do not guess unclear details.
+10. Preserve important story details.
+11. Do not make the recap extremely short.
+12. Use engaging narration suitable for a movie recap.
+13. Do not add unrelated opinions or false claims.
+14. Start with an engaging hook.
+15. Return only the Burmese recap script.
+16. Maintain the original story sequence.
+17. Include important character interactions.
+18. Do not skip important plot developments.
 
-IMPORTANT:
 Analyze the actual uploaded video.
 Do not create a story based on assumptions.
 Preserve important story details.
 `;
 
-    const contents = [
-      {
-        role: "user",
-        parts: [
-          {
-            fileData: {
-              fileUri: geminiFile.uri,
-              mimeType: geminiFile.mimeType || mimeType
+      const contents = [
+        {
+          role: "user",
+
+          parts: [
+            {
+              fileData: {
+                fileUri: geminiFile.uri,
+                mimeType:
+                  geminiFile.mimeType || mimeType
+              }
+            },
+
+            {
+              text: recapPrompt
             }
-          },
-          {
-            text: recapPrompt
-          }
-        ]
-      }
-    ];
+          ]
+        }
+      ];
 
-    const result = await generateRecapWithFallback(
-      ai,
-      contents
-    );
+      const result =
+        await generateRecapWithFallback(
+          ai,
+          contents
+        );
 
-    job.recapScript = result.text;
-    job.recapModel = result.model;
+      job.recapScript = result.text;
+      job.recapModel = result.model;
 
-    job.recapStatus = "completed";
-    job.status = "ready";
-    job.progress = 50;
-    job.stage = "Burmese recap script generated";
-    job.error = null;
+      job.recapStatus = "completed";
+      job.status = "ready";
+      job.progress = 50;
+      job.stage = "Burmese recap script generated";
+      job.error = null;
 
-    return res.json({
-      success: true,
-      message: "Burmese recap script generated successfully.",
-      usedModel: result.model,
+      return res.json({
+        success: true,
 
-      job: {
-        id: job.id,
-        status: job.status,
-        progress: job.progress,
-        stage: job.stage,
-        recapStatus: job.recapStatus,
-        recapScript: job.recapScript,
-        recapModel: job.recapModel
-      }
-    });
+        message:
+          "Burmese recap script generated successfully.",
 
-  } catch (error) {
-    console.error("GEMINI RECAP ERROR:", error);
+        usedModel: result.model,
 
-    const temporaryError =
-      isTemporaryGeminiError(error) ||
-      Number(error.status) === 503;
+        job: {
+          id: job.id,
+          status: job.status,
+          progress: job.progress,
+          stage: job.stage,
 
-    job.recapStatus = "failed";
-    job.status = "error";
-    job.error = error.message || "AI recap failed.";
-    job.stage = "AI recap failed";
+          recapStatus: job.recapStatus,
+          recapScript: job.recapScript,
+          recapModel: job.recapModel
+        }
+      });
 
-    return res.status(
-      temporaryError ? 503 : 500
-    ).json({
-      success: false,
-      message: job.error,
-      errorType: temporaryError
-        ? "GEMINI_TEMPORARILY_UNAVAILABLE"
-        : "GEMINI_RECAP_FAILED"
-    });
+    } catch (error) {
+      console.error(
+        "GEMINI RECAP ERROR:",
+        error
+      );
+
+      const temporaryError =
+        isTemporaryGeminiError(error) ||
+        Number(error.status) === 503;
+
+      job.recapStatus = "failed";
+      job.status = "error";
+      job.error = getErrorMessage(error);
+      job.stage = "AI recap failed";
+
+      return res.status(
+        temporaryError ? 503 : 500
+      ).json({
+        success: false,
+        message: job.error,
+
+        errorType: temporaryError
+          ? "GEMINI_TEMPORARILY_UNAVAILABLE"
+          : "GEMINI_RECAP_FAILED"
+      });
+    }
   }
-});
+);
 
 // --------------------------------------------------
 // GENERATE BURMESE VOICE
 // --------------------------------------------------
 
-app.post("/api/jobs/:id/voice", async (req, res) => {
-  const job = jobs.get(req.params.id);
+app.post(
+  "/api/jobs/:id/voice",
+  async (req, res) => {
+    const job = jobs.get(req.params.id);
 
-  if (!job) {
-    return res.status(404).json({
-      success: false,
-      message: "Job not found."
-    });
-  }
-
-  const text = String(
-    req.body?.text || job.recapScript || ""
-  ).trim();
-
-  if (!text) {
-    return res.status(400).json({
-      success: false,
-      message: "Recap script is empty."
-    });
-  }
-
-  if (job.voiceStatus === "processing") {
-    return res.status(409).json({
-      success: false,
-      message: "Voice generation is already processing."
-    });
-  }
-
-  try {
-    const ai = await getAIClient();
-
-    job.voiceStatus = "processing";
-    job.progress = 55;
-    job.stage = "Generating Burmese AI voice";
-    job.error = null;
-
-    const chunks = splitText(text, 3000);
-
-    if (!chunks.length) {
-      throw new Error("No usable text was found.");
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: "Job not found."
+      });
     }
 
-    const chunkFiles = [];
+    const text = String(
+      req.body?.text ||
+      job.recapScript ||
+      ""
+    ).trim();
+
+    if (!text) {
+      return res.status(400).json({
+        success: false,
+        message: "Recap script is empty."
+      });
+    }
+
+    if (job.voiceStatus === "processing") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Voice generation is already processing."
+      });
+    }
 
     try {
-      for (let i = 0; i < chunks.length; i++) {
-        const chunkPath = path.join(
-          TEMP_DIR,
-          `${job.id}-voice-${i}.wav`
+      const ai = await getAIClient();
+
+      job.voiceStatus = "processing";
+      job.progress = 55;
+      job.stage = "Generating Burmese AI voice";
+      job.error = null;
+
+      const chunks = splitText(text, 2500);
+
+      if (!chunks.length) {
+        throw new Error(
+          "No usable text was found."
         );
-
-        await generateSpeech(
-          ai,
-          chunks[i],
-          chunkPath
-        );
-
-        chunkFiles.push(chunkPath);
-
-        job.progress = 55 + Math.round(
-          ((i + 1) / chunks.length) * 25
-        );
-
-        job.stage =
-          `Generating voice ${i + 1}/${chunks.length}`;
       }
 
-      const voiceFileName = `${job.id}-voice.wav`;
+      const chunkFiles = [];
 
-      const voicePath = path.join(
-        OUTPUT_DIR,
-        voiceFileName
-      );
+      try {
+        for (
+          let i = 0;
+          i < chunks.length;
+          i++
+        ) {
+          const chunkPath = path.join(
+            TEMP_DIR,
+            `${job.id}-voice-${i}.wav`
+          );
 
-      await combineWavFiles(
-        chunkFiles,
-        voicePath
-      );
+          await generateSpeech(
+            ai,
+            chunks[i],
+            chunkPath
+          );
 
-      job.voiceFile = voicePath;
-      job.voiceUrl = outputUrl(req, voiceFileName);
-      job.voiceStatus = "completed";
-      job.progress = 80;
-      job.stage = "Burmese voice generated";
+          chunkFiles.push(chunkPath);
 
-      return res.json({
-        success: true,
-        message: "Burmese AI voice generated successfully.",
+          job.progress = 55 + Math.round(
+            ((i + 1) / chunks.length) * 25
+          );
 
-        job: {
-          id: job.id,
-          voiceStatus: job.voiceStatus,
-          voiceUrl: job.voiceUrl,
-          progress: job.progress,
-          stage: job.stage
+          job.stage =
+            `Generating voice ${i + 1}/${chunks.length}`;
         }
-      });
 
-    } finally {
-      for (const file of chunkFiles) {
-        if (fs.existsSync(file)) {
-          try {
-            await fsp.unlink(file);
-          } catch (cleanupError) {
-            console.error(
-              "VOICE TEMP CLEANUP ERROR:",
-              cleanupError.message
+        const voiceFileName =
+          `${job.id}-voice.wav`;
+
+        const voicePath = path.join(
+          OUTPUT_DIR,
+          voiceFileName
+        );
+
+        await combineWavFiles(
+          chunkFiles,
+          voicePath
+        );
+
+        // Validate generated audio.
+        const audioInfo = await new Promise(
+          (resolve, reject) => {
+            ffmpeg.ffprobe(
+              voicePath,
+              (error, metadata) => {
+                if (error) {
+                  return reject(error);
+                }
+
+                const audioStream =
+                  metadata.streams.find(
+                    stream =>
+                      stream.codec_type === "audio"
+                  );
+
+                if (!audioStream) {
+                  return reject(
+                    new Error(
+                      "Generated file has no audio stream."
+                    )
+                  );
+                }
+
+                resolve({
+                  duration: Number(
+                    metadata.format.duration || 0
+                  ),
+                  codec: audioStream.codec_name
+                });
+              }
             );
           }
+        );
+
+        if (audioInfo.duration <= 0) {
+          throw new Error(
+            "Generated audio duration is invalid."
+          );
+        }
+
+        job.voiceFile = voicePath;
+        job.voiceUrl = outputUrl(
+          req,
+          voiceFileName
+        );
+
+        job.voiceStatus = "completed";
+        job.progress = 80;
+        job.stage = "Burmese voice generated";
+        job.error = null;
+
+        return res.json({
+          success: true,
+
+          message:
+            "Burmese AI voice generated successfully.",
+
+          job: {
+            id: job.id,
+            voiceStatus: job.voiceStatus,
+            voiceUrl: job.voiceUrl,
+            progress: job.progress,
+            stage: job.stage,
+            audioInfo
+          }
+        });
+
+      } finally {
+        for (const file of chunkFiles) {
+          await safeUnlink(file);
         }
       }
+
+    } catch (error) {
+      console.error(
+        "VOICE GENERATION ERROR:",
+        error
+      );
+
+      job.voiceStatus = "failed";
+      job.error = getErrorMessage(error);
+      job.stage = "Voice generation failed";
+
+      return res.status(500).json({
+        success: false,
+        message: job.error
+      });
+    }
+  }
+);
+
+// --------------------------------------------------
+// RENDER MP4 WITH BURMESE VOICE
+// --------------------------------------------------
+
+app.post(
+  "/api/jobs/:id/render",
+  async (req, res) => {
+    const job = jobs.get(req.params.id);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: "Job not found."
+      });
     }
 
-  } catch (error) {
-    console.error("VOICE GENERATION ERROR:", error);
+    if (
+      !job.filePath ||
+      !fs.existsSync(job.filePath)
+    ) {
+      return res.status(404).json({
+        success: false,
+        message: "Original video file is missing."
+      });
+    }
 
-    job.voiceStatus = "failed";
-    job.error = error.message || "Voice generation failed.";
-    job.stage = "Voice generation failed";
+    if (
+      !job.voiceFile ||
+      !fs.existsSync(job.voiceFile)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Generate the Burmese voice before rendering."
+      });
+    }
 
-    return res.status(500).json({
-      success: false,
-      message: job.error
-    });
-  }
-});
+    if (job.renderStatus === "processing") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Video rendering is already processing."
+      });
+    }
 
-// --------------------------------------------------
-// RENDER MP4 WITH GENERATED VOICE
-// --------------------------------------------------
+    try {
+      job.renderStatus = "processing";
+      job.status = "rendering";
+      job.progress = 82;
+      job.stage =
+        "Combining original video and Burmese voice";
+      job.error = null;
 
-app.post("/api/jobs/:id/render", async (req, res) => {
-  const job = jobs.get(req.params.id);
+      const outputFileName =
+        `${job.id}-recap.mp4`;
 
-  if (!job) {
-    return res.status(404).json({
-      success: false,
-      message: "Job not found."
-    });
-  }
+      const outputPath = path.join(
+        OUTPUT_DIR,
+        outputFileName
+      );
 
-  if (!job.filePath || !fs.existsSync(job.filePath)) {
-    return res.status(404).json({
-      success: false,
-      message: "Original video file is missing."
-    });
-  }
+      // Keep the full original video duration.
+      // Replace the original audio with Burmese narration.
+      // If narration is shorter, pad with silence.
+      const duration = Number(
+        job.videoInfo?.duration || 0
+      );
 
-  if (!job.voiceFile || !fs.existsSync(job.voiceFile)) {
-    return res.status(400).json({
-      success: false,
-      message: "Generate the Burmese voice before rendering."
-    });
-  }
-
-  if (job.renderStatus === "processing") {
-    return res.status(409).json({
-      success: false,
-      message: "Video rendering is already processing."
-    });
-  }
-
-  try {
-    job.renderStatus = "processing";
-    job.status = "rendering";
-    job.progress = 82;
-    job.stage = "Combining video and Burmese voice";
-    job.error = null;
-
-    const outputFileName = `${job.id}-recap.mp4`;
-
-    const outputPath = path.join(
-      OUTPUT_DIR,
-      outputFileName
-    );
-
-    await runFFmpeg(
-      ffmpeg()
+      const command = ffmpeg()
         .input(job.filePath)
         .input(job.voiceFile)
         .outputOptions([
@@ -981,140 +1303,179 @@ app.post("/api/jobs/:id/render", async (req, res) => {
           "-c:v copy",
           "-c:a aac",
           "-b:a 192k",
-          "-shortest",
+          "-af apad",
           "-movflags +faststart"
-        ])
-        .output(outputPath)
-    );
+        ]);
 
-    job.outputFile = outputPath;
-    job.outputUrl = outputUrl(req, outputFileName);
-
-    job.renderStatus = "completed";
-    job.status = "ready";
-    job.progress = 100;
-    job.stage = "MP4 render completed";
-
-    return res.json({
-      success: true,
-      message: "MP4 rendered successfully.",
-
-      job: {
-        id: job.id,
-        renderStatus: job.renderStatus,
-        outputUrl: job.outputUrl,
-        progress: job.progress,
-        stage: job.stage
+      if (duration > 0) {
+        command.outputOptions([
+          "-t",
+          String(duration)
+        ]);
       }
-    });
 
-  } catch (error) {
-    console.error("RENDER ERROR:", error);
+      await runFFmpeg(
+        command.output(outputPath)
+      );
 
-    job.renderStatus = "failed";
-    job.status = "error";
-    job.error = error.message || "Video rendering failed.";
-    job.stage = "Video rendering failed";
+      // Verify output file.
+      if (
+        !fs.existsSync(outputPath) ||
+        fs.statSync(outputPath).size === 0
+      ) {
+        throw new Error(
+          "Rendered MP4 file is empty or missing."
+        );
+      }
 
-    return res.status(500).json({
-      success: false,
-      message: job.error
-    });
+      job.outputFile = outputPath;
+      job.outputUrl = outputUrl(
+        req,
+        outputFileName
+      );
+
+      job.renderStatus = "completed";
+      job.status = "ready";
+      job.progress = 100;
+      job.stage = "MP4 render completed";
+      job.error = null;
+
+      return res.json({
+        success: true,
+
+        message: "MP4 rendered successfully.",
+
+        job: {
+          id: job.id,
+          renderStatus: job.renderStatus,
+          outputUrl: job.outputUrl,
+          progress: job.progress,
+          stage: job.stage
+        }
+      });
+
+    } catch (error) {
+      console.error(
+        "RENDER ERROR:",
+        error
+      );
+
+      job.renderStatus = "failed";
+      job.status = "error";
+      job.error = getErrorMessage(error);
+      job.stage = "Video rendering failed";
+
+      return res.status(500).json({
+        success: false,
+        message: job.error
+      });
+    }
   }
-});
+);
 
 // --------------------------------------------------
 // GET JOB STATUS
 // --------------------------------------------------
 
-app.get("/api/jobs/:id", (req, res) => {
-  const job = jobs.get(req.params.id);
+app.get(
+  "/api/jobs/:id",
+  (req, res) => {
+    const job = jobs.get(req.params.id);
 
-  if (!job) {
-    return res.status(404).json({
-      success: false,
-      message: "Job not found."
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: "Job not found."
+      });
+    }
+
+    return res.json({
+      success: true,
+
+      job: {
+        id: job.id,
+
+        status: job.status,
+        progress: job.progress,
+        stage: job.stage,
+
+        originalName: job.originalName,
+        fileSize: job.fileSize,
+        videoInfo: job.videoInfo,
+
+        recapStatus: job.recapStatus,
+        recapScript: job.recapScript,
+        recapModel: job.recapModel,
+
+        voiceStatus: job.voiceStatus,
+        voiceUrl: job.voiceUrl,
+
+        renderStatus: job.renderStatus,
+        outputUrl: job.outputUrl,
+
+        error: job.error
+      }
     });
   }
-
-  return res.json({
-    success: true,
-
-    job: {
-      id: job.id,
-      status: job.status,
-      progress: job.progress,
-      stage: job.stage,
-
-      originalName: job.originalName,
-      fileSize: job.fileSize,
-      videoInfo: job.videoInfo,
-
-      recapStatus: job.recapStatus,
-      recapScript: job.recapScript,
-      recapModel: job.recapModel,
-
-      voiceStatus: job.voiceStatus,
-      voiceUrl: job.voiceUrl,
-
-      renderStatus: job.renderStatus,
-      outputUrl: job.outputUrl,
-
-      error: job.error
-    }
-  });
-});
+);
 
 // --------------------------------------------------
 // DELETE JOB
 // --------------------------------------------------
 
-app.delete("/api/jobs/:id", async (req, res) => {
-  const job = jobs.get(req.params.id);
+app.delete(
+  "/api/jobs/:id",
+  async (req, res) => {
+    const job = jobs.get(req.params.id);
 
-  if (!job) {
-    return res.status(404).json({
-      success: false,
-      message: "Job not found."
-    });
-  }
-
-  try {
-    const filesToDelete = [
-      job.filePath,
-      job.voiceFile,
-      job.outputFile
-    ];
-
-    for (const file of filesToDelete) {
-      if (file && fs.existsSync(file)) {
-        await fsp.unlink(file);
-      }
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: "Job not found."
+      });
     }
 
-    jobs.delete(req.params.id);
+    try {
+      const filesToDelete = [
+        job.filePath,
+        job.voiceFile,
+        job.outputFile
+      ];
 
-    return res.json({
-      success: true,
-      message: "Job deleted successfully."
-    });
+      for (const file of filesToDelete) {
+        await safeUnlink(file);
+      }
 
-  } catch (error) {
-    console.error("DELETE ERROR:", error);
+      jobs.delete(req.params.id);
 
-    return res.status(500).json({
-      success: false,
-      message: "Could not delete job."
-    });
+      return res.json({
+        success: true,
+        message: "Job deleted successfully."
+      });
+
+    } catch (error) {
+      console.error(
+        "DELETE ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message: "Could not delete job."
+      });
+    }
   }
-});
+);
 
 // --------------------------------------------------
-// ERROR HANDLER
+// GLOBAL ERROR HANDLER
 // --------------------------------------------------
 
 app.use((err, req, res, next) => {
-  console.error("SERVER ERROR:", err);
+  console.error(
+    "SERVER ERROR:",
+    err
+  );
 
   if (err instanceof multer.MulterError) {
     if (err.code === "LIMIT_FILE_SIZE") {
@@ -1133,7 +1494,7 @@ app.use((err, req, res, next) => {
 
   return res.status(400).json({
     success: false,
-    message: err.message || "Request failed."
+    message: getErrorMessage(err)
   });
 });
 
@@ -1143,14 +1504,33 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("--------------------------------------");
-  console.log("Burmese Auto Recap Backend Started");
+  console.log("HWA Burmese Auto Recap Backend");
+  console.log("Version: 4.0.0");
   console.log(`Port: ${PORT}`);
-  console.log(`Upload Directory: ${UPLOAD_DIR}`);
-  console.log(`Output Directory: ${OUTPUT_DIR}`);
-  console.log(`Gemini Recap Model: ${GEMINI_MODEL}`);
+
+  console.log(
+    `Upload Directory: ${UPLOAD_DIR}`
+  );
+
+  console.log(
+    `Output Directory: ${OUTPUT_DIR}`
+  );
+
+  console.log(
+    `Gemini Recap Model: ${GEMINI_MODEL}`
+  );
+
   console.log(
     `Gemini Fallback Models: ${GEMINI_FALLBACK_MODELS.join(", ")}`
   );
-  console.log(`Gemini TTS Model: ${GEMINI_TTS_MODEL}`);
+
+  console.log(
+    `Gemini TTS Model: ${GEMINI_TTS_MODEL}`
+  );
+
+  console.log(
+    `Gemini TTS Voice: ${GEMINI_TTS_VOICE}`
+  );
+
   console.log("--------------------------------------");
 });
