@@ -1,7 +1,8 @@
+
 {
   "name": "hwa-burmese-auto-recap",
-  "version": "5.0.0",
-  "description": "HWA Burmese Movie Recap and Video Editor",
+  "version": "5.1.0",
+  "description": "HWA Burmese Movie Recap and Automatic Video Editor",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
