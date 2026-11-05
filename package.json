@@ -1,7 +1,7 @@
 {
   "name": "hwa-burmese-auto-recap",
-  "version": "4.0.0",
-  "description": "HWA Burmese AI Movie Recap and Video Voiceover Backend",
+  "version": "5.0.0",
+  "description": "HWA Burmese Movie Recap and Video Editor",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,7 +10,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@google/genai": "^1.0.0",
+    "@google/genai": "^1.30.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
