@@ -1,7 +1,7 @@
 
 {
   "name": "hwa-burmese-movie-recap",
-  "version": "6.2.0",
+  "version": "6.3.0",
   "private": true,
   "type": "module",
   "description": "HWA EDITOR Burmese Movie Recap and AI Voiceover Backend",
