@@ -1,4 +1,3 @@
-
 import "dotenv/config";
 
 import express from "express";
@@ -18,8 +17,9 @@ import ffprobeStatic from "ffprobe-static";
 
 /* =========================================================
    HWA EDITOR · BURMESE MOVIE RECAP
-   Backend Version: 6.2.0
-   ========================================================= */
+   Backend Version: 6.3.0
+   Gemini 3.8 Flash + Interactions API
+========================================================= */
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,29 +32,32 @@ const UPLOAD_DIR = path.join(__dirname, "uploads");
 const OUTPUT_DIR = path.join(__dirname, "outputs");
 const TEMP_DIR = path.join(__dirname, "temp");
 
-/* -------------------------
-   BASIC CONFIGURATION
-------------------------- */
+/* =========================================================
+   CONFIGURATION
+========================================================= */
+
+const VERSION = "6.3.0";
 
 const MAX_UPLOAD_SIZE = 1024 * 1024 * 1024;
 const MAX_VIDEO_DURATION = 350 * 60;
 
-// Analyze long movies in smaller clips.
-// 15 minutes per Gemini request.
 const RECAP_CHUNK_SECONDS = 15 * 60;
 
-// Gemini TTS input model.
-// IMPORTANT: No Pro TTS fallback.
-const TTS_MODEL = "gemini-2.5-flash-preview-tts";
+const RECAP_MODEL = "gemini-3.8-flash";
 
-const TTS_VOICE = process.env.GEMINI_TTS_VOICE || "Kore";
+const TTS_MODEL =
+  process.env.GEMINI_TTS_MODEL ||
+  "gemini-2.5-flash-preview-tts";
 
-const RECAP_MODEL =
-  process.env.GEMINI_RECAP_MODEL || "gemini-2.5-flash";
+const TTS_VOICE =
+  process.env.GEMINI_TTS_VOICE || "Kore";
 
-/* -------------------------
+const TTS_SAMPLE_RATE = 24000;
+const TTS_CHANNELS = 1;
+
+/* =========================================================
    DIRECTORIES
-------------------------- */
+========================================================= */
 
 await Promise.all([
   fsp.mkdir(UPLOAD_DIR, { recursive: true }),
@@ -62,9 +65,9 @@ await Promise.all([
   fsp.mkdir(TEMP_DIR, { recursive: true })
 ]);
 
-/* -------------------------
+/* =========================================================
    FFMPEG CONFIGURATION
-------------------------- */
+========================================================= */
 
 if (ffmpegStatic) {
   ffmpeg.setFfmpegPath(ffmpegStatic);
@@ -74,9 +77,9 @@ if (ffprobeStatic?.path) {
   ffmpeg.setFfprobePath(ffprobeStatic.path);
 }
 
-/* -------------------------
+/* =========================================================
    EXPRESS CONFIGURATION
-------------------------- */
+========================================================= */
 
 app.set("trust proxy", 1);
 
@@ -100,9 +103,9 @@ app.use(
   })
 );
 
-/* -------------------------
-   MEMORY JOB DATABASE
-------------------------- */
+/* =========================================================
+   IN-MEMORY JOB DATABASE
+========================================================= */
 
 const jobs = new Map();
 
@@ -136,7 +139,10 @@ function sleep(ms) {
 
 function safeNumber(value, fallback = 0) {
   const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
+
+  return Number.isFinite(number)
+    ? number
+    : fallback;
 }
 
 function getPublicUrl(req, filePath) {
@@ -170,6 +176,7 @@ function getJob(jobId) {
     );
 
     error.status = 404;
+
     throw error;
   }
 
@@ -179,6 +186,7 @@ function getJob(jobId) {
 function getPublicJob(job, req) {
   return {
     id: job.id,
+
     originalName: job.originalName,
     size: job.size,
     duration: job.duration,
@@ -231,12 +239,14 @@ function getErrorText(error) {
 }
 
 function getErrorStatus(error) {
-  return Number(
+  const status = Number(
     error?.status ||
     error?.response?.status ||
     error?.codeNumber ||
     0
   );
+
+  return Number.isFinite(status) ? status : 0;
 }
 
 function isQuotaExceeded(error) {
@@ -257,23 +267,21 @@ function formatApiError(error) {
   if (isQuotaExceeded(error)) {
     return (
       "Google Gemini API ရဲ့ Quota/Billing ကန့်သတ်ချက်ကြောင့် " +
-      "မြန်မာ AI Voice မထုတ်နိုင်ပါ။ " +
-      "ဒီ Backend က Pro မော်ဒယ်ကို ပြောင်းမခေါ်ပါ။ " +
-      "Google AI Studio မှာ Flash TTS ရဲ့ Quota နဲ့ Billing ကို စစ်ပါ။"
+      "AI လုပ်ဆောင်မှု မအောင်မြင်ပါ။ Google AI Studio မှာ " +
+      "သက်ဆိုင်ရာ Model ရဲ့ Quota နဲ့ Billing ကို စစ်ပါ။"
     );
   }
 
   if (status === 429) {
     return (
-      "Gemini Flash TTS ကို ခဏအတွင်း Request များလွန်းလို့ " +
-      "ယာယီကန့်သတ်ထားပါတယ်။ ခဏနားပြီး ပြန်လုပ်ပါ။"
+      "Gemini API ကို Request များလွန်းလို့ ယာယီကန့်သတ်ထားပါတယ်။ " +
+      "ခဏနားပြီး ပြန်လုပ်ပါ။"
     );
   }
 
   if (status === 503) {
     return (
-      "Gemini Flash TTS Server ယာယီအလုပ်များနေပါတယ်။ " +
-      "ပြန်လည်ကြိုးစားပါ။"
+      "Gemini Server ယာယီအလုပ်များနေပါတယ်။ ခဏနားပြီး ပြန်လုပ်ပါ။"
     );
   }
 
@@ -382,17 +390,28 @@ const upload = multer({
 });
 
 /* =========================================================
-   API HEALTH CHECK
+   HEALTH CHECK
 ========================================================= */
+
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    name: "HWA EDITOR · BURMESE MOVIE RECAP",
+    version: VERSION,
+    status: "Running",
+    health: "/api/health"
+  });
+});
 
 app.get("/api/health", (req, res) => {
   res.json({
     success: true,
     status: "OK",
-    version: "6.2.0",
+    version: VERSION,
 
     models: {
       recap: RECAP_MODEL,
+      recapApi: "Interactions API",
       voice: TTS_MODEL,
       voiceName: TTS_VOICE
     },
@@ -471,7 +490,7 @@ app.post(
 
       jobs.set(id, job);
 
-      res.json({
+      return res.json({
         success: true,
 
         message: "Video Upload အောင်မြင်ပါပြီ။",
@@ -494,7 +513,7 @@ app.post(
 
       console.error("UPLOAD ERROR:", error);
 
-      res.status(400).json({
+      return res.status(400).json({
         success: false,
         error: error.message || "Video Upload မအောင်မြင်ပါ။"
       });
@@ -543,32 +562,49 @@ async function waitForGeminiFile(file, ai) {
 }
 
 /* =========================================================
-   RECAP JSON HELPERS
+   INTERACTIONS API RESPONSE TEXT
 ========================================================= */
 
 function responseToText(response) {
-  try {
-    const value = response.text;
-
-    if (typeof value === "function") {
-      return value.call(response) || "";
-    }
-
-    if (typeof value === "string") {
-      return value;
-    }
-  } catch {
-    // Continue to candidate parsing.
+  if (
+    typeof response?.output_text === "string" &&
+    response.output_text.trim()
+  ) {
+    return response.output_text.trim();
   }
 
-  const parts =
-    response?.candidates?.[0]?.content?.parts || [];
+  if (Array.isArray(response?.outputs)) {
+    const text = response.outputs
+      .filter(item => item?.type === "text")
+      .map(item => item.text || "")
+      .join("\n");
 
-  return parts
-    .filter(part => typeof part.text === "string")
-    .map(part => part.text)
+    if (text.trim()) {
+      return text.trim();
+    }
+  }
+
+  const steps = response?.steps || [];
+
+  const text = steps
+    .filter(step =>
+      step?.type === "model_output" ||
+      step?.type === "text"
+    )
+    .flatMap(step => step.content || [])
+    .filter(item =>
+      item?.type === "text" &&
+      typeof item.text === "string"
+    )
+    .map(item => item.text)
     .join("\n");
+
+  return text.trim();
 }
+
+/* =========================================================
+   JSON RESPONSE PARSER
+========================================================= */
 
 function parseJsonResponse(rawText) {
   if (!rawText || !rawText.trim()) {
@@ -601,6 +637,10 @@ function parseJsonResponse(rawText) {
     );
   }
 }
+
+/* =========================================================
+   TIMESTAMP HELPERS
+========================================================= */
 
 function parseTimestamp(value) {
   if (typeof value === "number") {
@@ -651,8 +691,6 @@ function normalizeRecapSegments(
     );
   }
 
-  const chunkDuration = chunkEnd - chunkStart;
-
   const result = [];
 
   for (const item of rawSegments) {
@@ -680,18 +718,12 @@ function normalizeRecapSegments(
       continue;
     }
 
-    // Gemini may return relative or absolute timestamps.
     let start = rawStart;
     let end = rawEnd;
 
-    if (
-      chunkStart > 0 &&
-      rawStart >= chunkStart - 1 &&
-      rawStart <= chunkEnd + 1
-    ) {
-      start = rawStart;
-      end = rawEnd;
-    } else {
+    // Prompt asks for relative timestamps.
+    // Convert to absolute video timestamps.
+    if (chunkStart > 0) {
       start = chunkStart + rawStart;
       end = chunkStart + rawEnd;
     }
@@ -732,8 +764,8 @@ function createRecapPrompt(chunkStart, chunkEnd) {
 ပေးထားသော Movie Video အပိုင်းကို သေချာလေ့လာပြီး
 သဘာဝကျသော မြန်မာဘာသာ Recap Script ရေးပါ။
 
-အပိုင်းအချိန်:
-${chunkStart} seconds မှ ${chunkEnd} seconds အထိ။
+ဤအပိုင်း၏ မူရင်း Video အချိန်မှာ
+${chunkStart} seconds မှ ${chunkEnd} seconds အထိ ဖြစ်သည်။
 
 အရေးကြီးသော စည်းမျဉ်းများ -
 
@@ -746,12 +778,15 @@ ${chunkStart} seconds မှ ${chunkEnd} seconds အထိ။
 ၇။ အရေးကြီးသော အဖြစ်အပျက်၊ အလှည့်အပြောင်းနှင့် Conflict များ မကျန်စေရ။
 ၈။ ဇာတ်လမ်းကို အလွန်အကျွံ ချုံ့မပစ်ပါနှင့်။
 ၉။ မြန်မာစကားပြောသံ သဘာဝကျပြီး YouTube Movie Recap Narration အတွက် သင့်တော်ရမည်။
-၁၀။ အင်္ဂလိပ်စာ မသုံးပါနှင့်။ ဇာတ်ကောင်အမည်များကို လိုအပ်သလို အသံထွက်အတိုင်း ရေးနိုင်သည်။
+၁၀။ မြန်မာဘာသာဖြင့်သာ ရေးပါ။
 ၁၁။ ဤ Video အပိုင်း၏ အချိန်နှင့် ကိုက်ညီသော Scene များကိုသာ ရေးပါ။
 ၁၂။ Timestamp များကို ဤအပိုင်း၏ အစမှ စတင်သည့် Relative Seconds အဖြစ် ရေးပါ။
 ၁၃။ Segment တစ်ခုစီတွင် ရှင်းလင်းသော Narration ပါရမည်။
 ၁၄။ Segment တစ်ခုစီ၏ Narration သည် အများအားဖြင့် စာကြောင်း ၂ မှ ၅ ကြောင်းခန့် ဖြစ်ပါစေ။
 ၁၅။ ဇာတ်လမ်းအဆုံးကို မခန့်မှန်းပါနှင့်။
+၁၆။ Video ထဲမှာ မမြင်ရ၊ မကြားရသော အချက်အလက်ကို အမှန်ဟု မရေးပါနှင့်။
+၁၇။ အရေးကြီးသော Scene များကို မကျော်ပါနှင့်။
+၁၈။ အချိန်အပိုင်းအခြားကို Video ထဲရှိ အဖြစ်အပျက်နှင့် ကိုက်ညီအောင် သတ်မှတ်ပါ။
 
 အောက်ပါ JSON ပုံစံအတိုင်းသာ ပြန်ပေးပါ။
 
@@ -770,13 +805,24 @@ JSON အပြင် အခြားရှင်းလင်းချက် မ�
 }
 
 /* =========================================================
-   RECAP VIDEO
+   RECAP VIDEO · GEMINI 3.8 FLASH
+   INTERACTIONS API
 ========================================================= */
 
 app.post(
   "/api/jobs/:id/recap",
   async (req, res) => {
-    const job = getJob(req.params.id);
+
+    let job;
+
+    try {
+      job = getJob(req.params.id);
+    } catch (error) {
+      return res.status(error.status || 404).json({
+        success: false,
+        error: error.message
+      });
+    }
 
     if (job.busy) {
       return res.status(409).json({
@@ -809,6 +855,12 @@ app.post(
         }
       });
 
+      if (!uploadedGeminiFile?.uri) {
+        throw new Error(
+          "Gemini Video File URI မရရှိပါ။"
+        );
+      }
+
       updateProgress(
         job,
         5,
@@ -820,17 +872,33 @@ app.post(
         ai
       );
 
+      if (
+        String(uploadedGeminiFile.state).toUpperCase()
+        !== "ACTIVE"
+      ) {
+        throw new Error(
+          "Gemini Video File အဆင်သင့်မဖြစ်သေးပါ။"
+        );
+      }
+
       const allSegments = [];
 
       const totalChunks = Math.ceil(
         job.duration / RECAP_CHUNK_SECONDS
       );
 
+      if (!totalChunks || totalChunks < 1) {
+        throw new Error(
+          "Video အရှည်ကို တွက်ချက်မရပါ။"
+        );
+      }
+
       for (
         let chunkIndex = 0;
         chunkIndex < totalChunks;
         chunkIndex++
       ) {
+
         const chunkStart =
           chunkIndex * RECAP_CHUNK_SECONDS;
 
@@ -842,49 +910,61 @@ app.post(
         updateProgress(
           job,
           10 + (chunkIndex / totalChunks) * 80,
-          `Movie အပိုင်း ${chunkIndex + 1}/${totalChunks} ကို Recap ရေးနေပါတယ်။`
+
+          `Gemini 3.8 Flash က Movie အပိုင်း ${chunkIndex + 1}/${totalChunks} ကို လေ့လာနေပါတယ်။`
         );
 
-        const response = await ai.models.generateContent({
+        const prompt = createRecapPrompt(
+          chunkStart,
+          chunkEnd
+        );
+
+        /*
+          Gemini Interactions API video input.
+          start_offset / end_offset require seconds strings.
+        */
+
+        const interaction = await ai.interactions.create({
+
           model: RECAP_MODEL,
 
-          contents: [
+          input: [
+
             {
-              role: "user",
+              type: "video",
 
-              parts: [
-                {
-                  fileData: {
-                    fileUri: uploadedGeminiFile.uri,
-                    mimeType:
-                      uploadedGeminiFile.mimeType ||
-                      job.mimeType
-                  },
+              uri: uploadedGeminiFile.uri,
 
-                  videoMetadata: {
-                    startOffset: `${chunkStart}s`,
-                    endOffset: `${chunkEnd}s`
-                  }
-                },
+              mime_type:
+                uploadedGeminiFile.mimeType ||
+                job.mimeType,
 
-                {
-                  text: createRecapPrompt(
-                    chunkStart,
-                    chunkEnd
-                  )
-                }
-              ]
+              processing: {
+                type: "static",
+
+                start_offset: `${chunkStart}s`,
+
+                end_offset: `${chunkEnd}s`
+              }
+            },
+
+            {
+              type: "text",
+
+              text: prompt
             }
-          ],
 
-          config: {
-            responseMimeType: "application/json",
-            temperature: 0.2,
-            maxOutputTokens: 8192
-          }
+          ]
+
         });
 
-        const rawText = responseToText(response);
+        const rawText = responseToText(interaction);
+
+        if (!rawText) {
+          throw new Error(
+            `Gemini 3.8 Flash က Movie အပိုင်း ${chunkIndex + 1} အတွက် Recap စာသား မပြန်ပေးပါ။`
+          );
+        }
 
         const parsed = parseJsonResponse(rawText);
 
@@ -895,10 +975,24 @@ app.post(
             chunkEnd
           );
 
+        if (!chunkSegments.length) {
+          throw new Error(
+            `Movie အပိုင်း ${chunkIndex + 1} မှာ အသုံးပြုနိုင်သော Recap Segment မတွေ့ပါ။`
+          );
+        }
+
         allSegments.push(...chunkSegments);
 
-        // Small pause between recap requests.
-        await sleep(1200);
+        updateProgress(
+          job,
+          10 + ((chunkIndex + 1) / totalChunks) * 80,
+
+          `Movie အပိုင်း ${chunkIndex + 1}/${totalChunks} Recap ပြီးပါပြီ။`
+        );
+
+        if (chunkIndex < totalChunks - 1) {
+          await sleep(1500);
+        }
       }
 
       if (!allSegments.length) {
@@ -907,10 +1001,13 @@ app.post(
         );
       }
 
-      allSegments.sort((a, b) => a.start - b.start);
+      allSegments.sort(
+        (a, b) => a.start - b.start
+      );
 
-      const hasMyanmar = allSegments.some(segment =>
-        /[\u1000-\u109F]/.test(segment.narration)
+      const hasMyanmar = allSegments.some(
+        segment =>
+          /[\u1000-\u109F]/.test(segment.narration)
       );
 
       if (!hasMyanmar) {
@@ -926,36 +1023,56 @@ app.post(
         .join("\n\n");
 
       job.status = "recap_done";
+      job.error = null;
 
       updateProgress(
         job,
         100,
-        "မြန်မာ Movie Recap အောင်မြင်ပါပြီ။"
+        "Gemini 3.8 Flash မြန်မာ Movie Recap အောင်မြင်ပါပြီ။"
       );
 
-      res.json({
+      return res.json({
         success: true,
-        message: "မြန်မာ Movie Recap အောင်မြင်ပါပြီ။",
+
+        message:
+          "Gemini 3.8 Flash မြန်မာ Movie Recap အောင်မြင်ပါပြီ။",
+
+        model: RECAP_MODEL,
 
         recapScript: job.recapScript,
+
         segments: job.segments,
 
         job: getPublicJob(job, req)
       });
 
     } catch (error) {
-      console.error("RECAP ERROR:", error);
+
+      console.error(
+        "GEMINI 3.8 RECAP ERROR:",
+        error
+      );
 
       job.status = "recap_error";
-      job.error = error.message;
 
-      res.status(getErrorStatus(error) || 500).json({
+      job.error =
+        formatApiError(error);
+
+      updateProgress(
+        job,
+        job.progress || 0,
+        "Recap မအောင်မြင်ပါ။"
+      );
+
+      return res.status(
+        getErrorStatus(error) || 500
+      ).json({
         success: false,
-        error: error.message ||
-          "Recap လုပ်ဆောင်မှု မအောင်မြင်ပါ။"
+        error: job.error
       });
 
     } finally {
+
       if (uploadedGeminiFile?.name) {
         try {
           const ai = getGemini();
@@ -963,6 +1080,7 @@ app.post(
           await ai.files.delete({
             name: uploadedGeminiFile.name
           });
+
         } catch (deleteError) {
           console.warn(
             "GEMINI FILE DELETE WARNING:",
@@ -983,10 +1101,13 @@ app.post(
 async function savePcmAsWav(
   filePath,
   pcmBuffer,
-  sampleRate = 24000,
-  channels = 1
+  sampleRate = TTS_SAMPLE_RATE,
+  channels = TTS_CHANNELS
 ) {
-  if (!Buffer.isBuffer(pcmBuffer) || pcmBuffer.length === 0) {
+  if (
+    !Buffer.isBuffer(pcmBuffer) ||
+    pcmBuffer.length === 0
+  ) {
     throw new Error(
       "Gemini TTS က Audio Data မပြန်ပေးပါ။"
     );
@@ -995,6 +1116,7 @@ async function savePcmAsWav(
   const header = Buffer.alloc(44);
 
   const bitsPerSample = 16;
+
   const byteRate =
     sampleRate * channels * bitsPerSample / 8;
 
@@ -1034,16 +1156,12 @@ async function savePcmAsWav(
 async function generateTtsPcm(text) {
   const ai = getGemini();
 
-  // Only this model is used.
-  // There is NO Pro model fallback.
-  const model = TTS_MODEL;
-
   let lastError = null;
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const response = await ai.models.generateContent({
-        model,
+        model: TTS_MODEL,
 
         contents: [
           {
@@ -1052,8 +1170,7 @@ async function generateTtsPcm(text) {
                 text:
                   "သဘာဝကျသော မြန်မာ Movie Recap Narrator အသံဖြင့် " +
                   "ရှင်းလင်းပြတ်သားစွာ ဖတ်ပါ။ " +
-                  "စာသားကို မပြောင်းလဲပါနှင့်။ " +
-                  "အင်္ဂလိပ်အသံထွက်ကို တတ်နိုင်သမျှ ရှောင်ပါ။\n\n" +
+                  "စာသားကို မပြောင်းလဲပါနှင့်။\n\n" +
                   text
               }
             ]
@@ -1092,14 +1209,16 @@ async function generateTtsPcm(text) {
         );
       }
 
-      return Buffer.from(base64Data, "base64");
+      return Buffer.from(
+        base64Data,
+        "base64"
+      );
 
     } catch (error) {
       lastError = error;
 
       const status = getErrorStatus(error);
 
-      // Do not retry exhausted quota.
       if (isQuotaExceeded(error)) {
         throw new Error(formatApiError(error));
       }
@@ -1108,7 +1227,6 @@ async function generateTtsPcm(text) {
         throw new Error(formatApiError(error));
       }
 
-      // Retry same Flash model only for temporary server errors.
       if (status === 503 && attempt < 2) {
         await sleep(8000 * (attempt + 1));
         continue;
@@ -1148,11 +1266,15 @@ async function concatenateWavFiles(
   const listText = inputFiles
     .map(file => {
       const escaped = file.replace(/'/g, "'\\''");
+
       return `file '${escaped}'`;
     })
     .join("\n");
 
-  await fsp.writeFile(listFile, listText);
+  await fsp.writeFile(
+    listFile,
+    listText
+  );
 
   await new Promise((resolve, reject) => {
     ffmpeg()
@@ -1179,7 +1301,17 @@ async function concatenateWavFiles(
 app.post(
   "/api/jobs/:id/voice",
   async (req, res) => {
-    const job = getJob(req.params.id);
+
+    let job;
+
+    try {
+      job = getJob(req.params.id);
+    } catch (error) {
+      return res.status(error.status || 404).json({
+        success: false,
+        error: error.message
+      });
+    }
 
     if (job.busy) {
       return res.status(409).json({
@@ -1229,7 +1361,9 @@ app.post(
           );
         }
 
-        const pcm = await generateTtsPcm(narration);
+        const pcm = await generateTtsPcm(
+          narration
+        );
 
         const filename =
           `${job.id}_voice_${String(i).padStart(4, "0")}.wav`;
@@ -1242,8 +1376,8 @@ app.post(
         await savePcmAsWav(
           audioPath,
           pcm,
-          24000,
-          1
+          TTS_SAMPLE_RATE,
+          TTS_CHANNELS
         );
 
         const audioDuration =
@@ -1258,7 +1392,6 @@ app.post(
           audioDuration
         });
 
-        // Reduce request pressure.
         if (i < total - 1) {
           await sleep(2000);
         }
@@ -1299,7 +1432,7 @@ app.post(
         "မြန်မာ AI Voice အောင်မြင်ပါပြီ။"
       );
 
-      res.json({
+      return res.json({
         success: true,
 
         message: "မြန်မာ AI Voice အောင်မြင်ပါပြီ။",
@@ -1320,7 +1453,9 @@ app.post(
 
       const status = getErrorStatus(error);
 
-      res.status(status === 429 ? 429 : 500).json({
+      return res.status(
+        status === 429 ? 429 : 500
+      ).json({
         success: false,
         error: job.error
       });
@@ -1416,7 +1551,17 @@ function renderOneSegment(
 app.post(
   "/api/jobs/:id/render",
   async (req, res) => {
-    const job = getJob(req.params.id);
+
+    let job;
+
+    try {
+      job = getJob(req.params.id);
+    } catch (error) {
+      return res.status(error.status || 404).json({
+        success: false,
+        error: error.message
+      });
+    }
 
     if (job.busy) {
       return res.status(409).json({
@@ -1506,6 +1651,7 @@ app.post(
       const concatText = renderedFiles
         .map(file => {
           const escaped = file.replace(/'/g, "'\\''");
+
           return `file '${escaped}'`;
         })
         .join("\n");
@@ -1554,7 +1700,7 @@ app.post(
         "HWA EDITOR အောင်မြင်စွာ MP4 ထုတ်ပြီးပါပြီ။"
       );
 
-      res.json({
+      const response = {
         success: true,
 
         message: "Final MP4 Render အောင်မြင်ပါပြီ။",
@@ -1565,13 +1711,14 @@ app.post(
         ),
 
         job: getPublicJob(job, req)
-      });
+      };
 
-      // Remove temporary rendered pieces.
       await fsp.rm(workDir, {
         recursive: true,
         force: true
       }).catch(() => {});
+
+      return res.json(response);
 
     } catch (error) {
       console.error("RENDER ERROR:", error);
@@ -1579,7 +1726,7 @@ app.post(
       job.status = "render_error";
       job.error = error.message;
 
-      res.status(500).json({
+      return res.status(500).json({
         success: false,
         error:
           error.message ||
@@ -1602,13 +1749,13 @@ app.get(
     try {
       const job = getJob(req.params.id);
 
-      res.json({
+      return res.json({
         success: true,
         job: getPublicJob(job, req)
       });
 
     } catch (error) {
-      res.status(error.status || 404).json({
+      return res.status(error.status || 404).json({
         success: false,
         error: error.message
       });
@@ -1658,13 +1805,13 @@ app.delete(
 
       jobs.delete(job.id);
 
-      res.json({
+      return res.json({
         success: true,
         message: "Video Job ဖျက်ပြီးပါပြီ။"
       });
 
     } catch (error) {
-      res.status(error.status || 500).json({
+      return res.status(error.status || 500).json({
         success: false,
         error: error.message
       });
@@ -1708,7 +1855,7 @@ app.use((error, req, res, next) => {
     error.message ||
     "Server မှာ မသိရသေးတဲ့ အမှားဖြစ်နေပါတယ်။";
 
-  res.status(error.status || 500).json({
+  return res.status(error.status || 500).json({
     success: false,
     error: message
   });
@@ -1721,10 +1868,11 @@ app.use((error, req, res, next) => {
 app.listen(PORT, () => {
   console.log("----------------------------------------");
   console.log("HWA EDITOR · BURMESE MOVIE RECAP");
-  console.log("Backend Version: 6.2.0");
+  console.log(`Backend Version: ${VERSION}`);
   console.log("----------------------------------------");
   console.log(`Server running on port ${PORT}`);
   console.log(`Recap Model: ${RECAP_MODEL}`);
+  console.log("Recap API: Gemini Interactions API");
   console.log(`TTS Model: ${TTS_MODEL}`);
   console.log(`TTS Voice: ${TTS_VOICE}`);
   console.log("Pro TTS fallback: DISABLED");
